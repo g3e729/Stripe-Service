@@ -1,0 +1,114 @@
+<?php
+
+namespace App\Services;
+
+use Stripe\Stripe;
+use Stripe\Plan as StripePlan;
+use Stripe\Token as StripeToken;
+use Stripe\Charge as StripeCharge;
+use Stripe\Customer as StripeCustomer;
+use Stripe\Error\Card as StripeErrorCard;
+use Stripe\Invoice as StripeInvoice;
+use Stripe\Subscription as StripeSubscription;
+
+class StripeService
+{
+	const CURRENCY = 'jpy';
+	protected $user = null;
+	public $customer = null;
+
+	public function __construct($user = null)
+	{
+		Stripe::setApiKey(config('services.stripe.secret'));
+		$this->user = $user;
+
+		if ($this->user && $this->user->stripe_id) {
+			$this->customer = $this->getCustomer($this->user->stripe_id);
+		}
+	}
+
+	public function getCustomer($id)
+	{
+		try {
+			return StripeCustomer::retrieve($id);
+		} catch(\Exception $ex) {
+			\Log::error(__METHOD__ . '@' . $ex->getLine() . ': ' . $ex->getMessage());
+		}
+	}
+
+	public function storeCard($data = [])
+	{
+		try {
+			$token = StripeToken::create(['card' => [
+				'cvc'       => $data['cvc'],
+				'exp_month' => $data['expiration_month'],
+				'exp_year'  => $data['expiration_year'],
+				'name'      => $this->user->name,
+				'number'    => $data['card_number'],
+			]]);
+
+			if (isset($token->id)) {
+				if ($ex = $this->createCustomerAccount($token)) {
+					return $ex;
+				}
+
+				\Log::notice(__METHOD__ . ': Credit card was added to user: ' . $this->user->id);
+				return false;
+			}
+		} catch (\Exception $ex) {
+			\Log::error(__METHOD__ . '@' . $ex->getLine() . ': ' . $ex->getMessage());
+		}
+	}
+
+	public function chargeMember(array $data = [])
+	{
+		try {
+			$charge = StripeCharge::create([
+				'amount'        => $data['amount'] ?? 0,
+				'currency'      => self::CURRENCY,
+				'customer'      => $this->user->stripe_id ?? NULL,
+				'description'   => $data['description'] ?? '',
+				'metadata'      => [],
+				'receipt_email' => $this->user->email,
+			]);
+
+			if (isset($charge->id)) {
+				\Log::notice(__METHOD__ . ': Amount ' . ($data['amount'] ?? 0) . ' was charged to user: ' . $this->user->id);
+				return $charge;
+			}
+		} catch (\Exception $ex) {
+			\Log::error(__METHOD__ . '@' . $ex->getLine() . ': ' . $ex->getMessage());
+		}
+	}
+
+	private function createCustomerAccount($token)
+	{
+		try {
+			if (empty($this->customer)) {
+				$this->customer = StripeCustomer::create([
+					'email'         => $this->user->email,
+					'source'        => $token->id,
+					'description'   => $this->user->name,
+					'metadata'      => [
+						'user_id' => $this->user->id,
+					],
+				]);
+
+				\Log::notice(__METHOD__ . ': Created Stripe customer account for user: ' . $this->user->id . '!');
+			} else {
+				$this->customer->source = $token->id;
+				$this->customer->save();
+			}
+
+			$this->user->card_brand = $token->card->brand;
+			$this->user->card_last_four = $token->card->last4;
+			$this->user->stripe_id = $this->customer->id;
+			$this->user->save();
+
+			return false;
+		} catch (\Exception $ex) {
+			\Log::error(__METHOD__ . '@' . $ex->getLine() . ': ' . $ex->getMessage());
+			return $ex;
+		}
+	}
+}
